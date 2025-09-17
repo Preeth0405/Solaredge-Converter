@@ -30,6 +30,27 @@ if not st.session_state.authenticated:
 
 st.title("⏱ Data Aggregation Tool")
 
+# Sidebar content
+st.sidebar.header("ℹ️ How to Use")
+st.sidebar.markdown("""
+1. **Upload your file** (Excel or CSV) with a time column and data columns.
+2. **Select the time column** from the dropdown.
+3. Choose the **aggregation interval** (e.g., 30 min, 1 hour, daily).
+4. The app will automatically detect which columns should be **averaged** 
+   (irradiance, power, temperature) and which should be **summed** (energy).
+5. Review the aggregated data in the preview.
+6. **Download the processed file** as Excel for your records.
+""")
+
+st.sidebar.header("📖 Glossary")
+st.sidebar.markdown("""
+- **Irradiance** (W/m²): Solar energy received on a surface → **Average** over interval.  
+- **Power** (kW): Instantaneous system output → **Average** over interval.  
+- **Temperature** (°C): Module or ambient temperature → **Average** over interval.  
+- **Energy** (kWh): Cumulative energy generated/consumed → **Sum** over interval.  
+- **Interval (Resample)**: Time window to group data (e.g., 30min, 1H, 1D).  
+""")
+
 # Upload file
 uploaded_file = st.file_uploader("Upload Excel/CSV file", type=["xlsx", "csv"])
 
