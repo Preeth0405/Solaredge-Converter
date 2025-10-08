@@ -67,7 +67,7 @@ if uploaded_file:
     time_col = st.selectbox("Select Time Column", df.columns)
 
     # Convert time to datetime
-    df[time_col] = pd.to_datetime(df[time_col])
+    df[time_col] = df[time_col] = pd.to_datetime(df[time_col], dayfirst=True, format='mixed', errors='coerce')
 
     # Set index
     df = df.set_index(time_col)
