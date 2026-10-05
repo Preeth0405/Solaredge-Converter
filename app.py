@@ -34,11 +34,30 @@ def aggregate_data(df, time_col, freq, naive_timezone, output_timezone):
     numeric = numeric.drop(columns=ignored)
     if numeric.empty:
         raise ValueError("No valid timestamps and numeric data were found.")
+    # Remove identical overlapping samples, including their timestamp.
+    records = numeric.reset_index()
+    original_count = len(records)
+    records = records.drop_duplicates()
+    duplicates_removed = original_count - len(records)
+    if records[time_col].duplicated().any():
+        conflicts = records.loc[records[time_col].duplicated(keep=False), time_col].nunique()
+        raise ValueError(
+            f"Found {conflicts} overlapping timestamps with different readings. "
+            "Remove the overlapping files/sheets or resolve those readings before combining."
+        )
+    numeric = records.set_index(time_col).sort_index()
     rules = {}
     for col in numeric.columns:
         label = str(col).lower()
         rules[col] = (lambda values: values.sum(min_count=1)) if "energy" in label else "mean"
-    return numeric.resample(freq).agg(rules), invalid_rows, ignored
+    return numeric.resample(freq).agg(rules), invalid_rows, ignored, duplicates_removed
+
+
+def combine_sources(sources, time_col):
+    missing = [name for name, frame in sources if time_col not in frame.columns]
+    if missing:
+        raise ValueError(f"Time column '{time_col}' is missing in: " + ", ".join(missing))
+    return pd.concat([frame for _, frame in sources], ignore_index=True, sort=False)
 
 
 def excel_bytes(df):
@@ -79,11 +98,11 @@ def main():
     st.title("⏱ Data Aggregation Tool")
     st.sidebar.header("ℹ️ How to Use")
     st.sidebar.markdown("""
-1. Upload an Excel or CSV file.
-2. Select the time column and aggregation interval.
+1. Upload one or more monthly Excel or CSV files.
+2. Select the data sheets, time column and aggregation interval.
 3. Set the timezone for timestamps that do not include an offset.
 4. Choose the timezone to use for aggregation and export.
-5. Review and download the results.
+5. Download all selected months as one Excel file.
 """)
     st.sidebar.header("📖 Glossary")
     st.sidebar.markdown("""
@@ -94,38 +113,72 @@ def main():
 - **Missing data:** remains blank when an entire interval has no readings.
 """)
 
-    uploaded_file = st.file_uploader("Upload Excel/CSV file", type=["xlsx", "csv"])
-    if uploaded_file is None:
+    uploaded_files = st.file_uploader(
+        "Upload monthly Excel/CSV files", type=["xlsx", "csv"], accept_multiple_files=True
+    )
+    if not uploaded_files:
         return
-    try:
-        df = pd.read_csv(uploaded_file) if uploaded_file.name.lower().endswith(".csv") else pd.read_excel(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read the file: {exc}")
+    sources = []
+    for file_number, uploaded_file in enumerate(uploaded_files):
+        try:
+            uploaded_file.seek(0)
+            if uploaded_file.name.lower().endswith(".csv"):
+                sources.append((uploaded_file.name, pd.read_csv(uploaded_file)))
+            else:
+                book = pd.ExcelFile(uploaded_file)
+                selected_sheets = st.multiselect(
+                    f"Data sheets in {uploaded_file.name}",
+                    options=book.sheet_names,
+                    default=book.sheet_names,
+                    key=f"sheets_{file_number}_{uploaded_file.name}",
+                    help="Select only sheets containing the monthly raw data. Deselect summary or instruction sheets.",
+                )
+                for sheet in selected_sheets:
+                    sources.append((f"{uploaded_file.name} / {sheet}", book.parse(sheet)))
+        except Exception as exc:
+            st.error(f"Could not read {uploaded_file.name}: {exc}")
+            st.stop()
+    sources = [(name, frame) for name, frame in sources if not frame.empty]
+    if not sources:
+        st.warning("Select at least one sheet containing data.")
         st.stop()
+
+    st.subheader("Selected Data Sources")
+    st.dataframe(pd.DataFrame([
+        {"File / sheet": name, "Rows": len(frame)} for name, frame in sources
+    ]), width="stretch", hide_index=True)
+    common_columns = [col for col in sources[0][1].columns if all(col in frame.columns for _, frame in sources)]
+    if not common_columns:
+        st.error("The selected data sheets do not share a time column. Use matching column headings or deselect unrelated sheets.")
+        st.stop()
+    time_col = st.selectbox("Select Time Column", common_columns)
+    df = combine_sources(sources, time_col)
 
     st.subheader("Raw Data Preview")
     st.dataframe(df.head(), width="stretch")
     if df.empty:
         st.warning("The uploaded file is empty.")
         st.stop()
-    time_col = st.selectbox("Select Time Column", df.columns)
     freq = st.selectbox("Select aggregation interval", ["30min", "1h", "2h", "1D"])
     naive_timezone = st.selectbox("Timezone for timestamps without an offset", ["Europe/London", "UTC"])
     output_timezone = st.selectbox("Aggregation and export timezone", ["Europe/London", "UTC"])
     st.caption("Timestamps with Z or a UTC offset retain their actual instant. Excel includes a UTC offset column to distinguish repeated clock times when daylight saving ends.")
 
     try:
-        result, invalid_rows, ignored = aggregate_data(df, time_col, freq, naive_timezone, output_timezone)
+        result, invalid_rows, ignored, duplicates_removed = aggregate_data(df, time_col, freq, naive_timezone, output_timezone)
         if invalid_rows:
             st.warning(f"Skipped {invalid_rows} rows with invalid or ambiguous timestamps.")
         if ignored:
             st.info("Columns without numeric readings were omitted: " + ", ".join(map(str, ignored)))
+        if duplicates_removed:
+            st.info(f"Removed {duplicates_removed} identical overlapping samples to prevent double counting.")
+        st.caption(f"Combined {len(sources)} data sources into one chronological dataset.")
         st.subheader("Aggregated Data")
         st.dataframe(result.head(50), width="stretch")
         st.download_button(
             "📥 Download Aggregated Data",
             data=excel_bytes(result),
-            file_name="aggregated_data.xlsx",
+            file_name="combined_aggregated_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
