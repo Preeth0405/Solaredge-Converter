@@ -23,11 +23,13 @@ def prepare_times(values, naive_timezone):
     return pd.to_datetime(values.map(parse), utc=True)
 
 
-def aggregate_data(df, time_col, freq, naive_timezone, output_timezone):
+def aggregate_data(df, time_col, freq, naive_timezone, output_timezone,
+                   overlap_policy="Stop and review"):
     df = df.copy()
     df[time_col] = prepare_times(df[time_col], naive_timezone)
     invalid_rows = int(df[time_col].isna().sum())
-    df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
+    # Stable sorting preserves upload order for first/last overlap decisions.
+    df = df.dropna(subset=[time_col]).set_index(time_col).sort_index(kind="stable")
     df.index = df.index.tz_convert(output_timezone)
     numeric = df.apply(pd.to_numeric, errors="coerce")
     ignored = [col for col in numeric.columns if not numeric[col].notna().any()]
@@ -39,18 +41,28 @@ def aggregate_data(df, time_col, freq, naive_timezone, output_timezone):
     original_count = len(records)
     records = records.drop_duplicates()
     duplicates_removed = original_count - len(records)
-    if records[time_col].duplicated().any():
-        conflicts = records.loc[records[time_col].duplicated(keep=False), time_col].nunique()
-        raise ValueError(
-            f"Found {conflicts} overlapping timestamps with different readings. "
-            "Remove the overlapping files/sheets or resolve those readings before combining."
-        )
-    numeric = records.set_index(time_col).sort_index()
+    overlap_review = records.loc[records[time_col].duplicated(keep=False)].copy()
+    conflicts = 0
+    if not overlap_review.empty:
+        differences = overlap_review.groupby(time_col, sort=False).nunique(dropna=True)
+        conflicts = int(differences.gt(1).any(axis=1).sum())
+        if conflicts and overlap_policy == "Stop and review":
+            raise ValueError(
+                f"Found {conflicts} overlapping timestamps with different readings. "
+                "Choose an overlap handling option below the upload preview to continue."
+            )
+        # Coalesce complementary blanks. For differing nonblank readings use
+        # the selected upload order, rather than averaging or summing duplicates.
+        grouped = records.groupby(time_col, sort=True)
+        numeric = grouped.last() if overlap_policy == "Keep last reading" else grouped.first()
+        duplicates_removed += len(records) - len(numeric)
+    else:
+        numeric = records.set_index(time_col).sort_index()
     rules = {}
     for col in numeric.columns:
         label = str(col).lower()
         rules[col] = (lambda values: values.sum(min_count=1)) if "energy" in label else "mean"
-    return numeric.resample(freq).agg(rules), invalid_rows, ignored, duplicates_removed
+    return numeric.resample(freq).agg(rules), invalid_rows, ignored, duplicates_removed, overlap_review, conflicts
 
 
 def combine_sources(sources, time_col):
@@ -60,14 +72,22 @@ def combine_sources(sources, time_col):
     return pd.concat([frame for _, frame in sources], ignore_index=True, sort=False)
 
 
-def excel_bytes(df):
+def excel_bytes(df, overlap_review=None, overlap_policy="Stop and review"):
     export = df.copy()
     # Keep the displayed local clock time; Excel cannot store timezone metadata.
     labels = export.index.strftime("%z")
     export.index = export.index.tz_localize(None)
     export.insert(0, "UTC offset", labels)
     buffer = BytesIO()
-    export.to_excel(buffer, engine="openpyxl", sheet_name="Aggregated Data")
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Aggregated Data")
+        if overlap_review is not None and not overlap_review.empty:
+            review = overlap_review.copy()
+            timestamp_column = review.columns[0]
+            review.insert(1, "UTC offset", review[timestamp_column].dt.strftime("%z"))
+            review[timestamp_column] = review[timestamp_column].dt.tz_localize(None)
+            review.insert(2, "Resolution", overlap_policy)
+            review.to_excel(writer, sheet_name="Overlap Review", index=False)
     return buffer.getvalue()
 
 
@@ -162,22 +182,34 @@ def main():
     freq = st.selectbox("Select aggregation interval", ["30min", "1h", "2h", "1D"])
     naive_timezone = st.selectbox("Timezone for timestamps without an offset", ["Europe/London", "UTC"])
     output_timezone = st.selectbox("Aggregation and export timezone", ["Europe/London", "UTC"])
+    overlap_policy = st.selectbox(
+        "Overlapping timestamps with different readings",
+        ["Stop and review", "Keep last reading", "Keep first reading"],
+        help="First/last follows the file order shown above, then sheet order and original row order. Only one nonblank reading per channel and timestamp is retained. Energy is not summed across overlapping copies.",
+    )
+    if overlap_policy != "Stop and review":
+        st.info(f"{overlap_policy}: verify the file order above. All overlapping readings will be included in an Overlap Review sheet in the download.")
     st.caption("Timestamps with Z or a UTC offset retain their actual instant. Excel includes a UTC offset column to distinguish repeated clock times when daylight saving ends.")
 
     try:
-        result, invalid_rows, ignored, duplicates_removed = aggregate_data(df, time_col, freq, naive_timezone, output_timezone)
+        result, invalid_rows, ignored, duplicates_removed, overlap_review, conflicts = aggregate_data(df, time_col, freq, naive_timezone, output_timezone, overlap_policy)
         if invalid_rows:
             st.warning(f"Skipped {invalid_rows} rows with invalid or ambiguous timestamps.")
         if ignored:
             st.info("Columns without numeric readings were omitted: " + ", ".join(map(str, ignored)))
         if duplicates_removed:
-            st.info(f"Removed {duplicates_removed} identical overlapping samples to prevent double counting.")
+            st.info(f"Merged {duplicates_removed} overlapping samples to prevent double counting.")
+        if conflicts:
+            st.warning(f"Resolved {conflicts} timestamps with differing readings using: {overlap_policy}.")
+        if not overlap_review.empty:
+            with st.expander("Review overlapping readings"):
+                st.dataframe(overlap_review, width="stretch")
         st.caption(f"Combined {len(sources)} data sources into one chronological dataset.")
         st.subheader("Aggregated Data")
         st.dataframe(result.head(50), width="stretch")
         st.download_button(
             "📥 Download Aggregated Data",
-            data=excel_bytes(result),
+            data=excel_bytes(result, overlap_review, overlap_policy),
             file_name="combined_aggregated_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
